@@ -1,171 +1,210 @@
-# Keenetic Backup with ZIP and smart rotation
-# Run: powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File backup.ps1 -Password "BASE64"
-
+# File: backup_keenetic.ps1 — Keenetic backup via HTTP Proxy API with Basic Auth, JSON to TXT conversion, retry logic
 param(
-    [string]$RouterIp = "192.168.0.1 or *.netcraze.io",
+    [string]$RouterDomain = "rci.адрес.netcraze.link",
     [string]$Login = "backup",
     [string]$Password = "",
     [string]$BackupDir = "C:\Backups\Keenetic"
 )
 
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = "Stop"
 
 function Log {
     param([string]$Text)
-    $time = Get-Date -Format "HH:mm:ss"
+    $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[$time] $Text"
 }
 
-# Decode password
+# Decode Base64 password
 if ($Password -eq "") {
-    Log "ERROR: No password"
+    Log "ERROR: No password provided"
     exit 1
 }
 
 try {
     $bytes = [Convert]::FromBase64String($Password)
     $RealPassword = [System.Text.Encoding]::UTF8.GetString($bytes)
-    Log "Password loaded: ****"
+    Log "Password decoded successfully"
 } catch {
     Log "ERROR: Invalid Base64 password"
     exit 1
 }
 
-# Create folder
+# Create backup directory
 if (!(Test-Path $BackupDir)) {
-    New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
-}
-
-# Auth
-Log "=== AUTH ==="
-$AuthUrl = "http://$RouterIp/auth"
-$Session = $null
-
-try {
-    Invoke-WebRequest -Uri $AuthUrl -Method GET -SessionVariable Session -TimeoutSec 10 | Out-Null
-} catch {
-    if ($_.Exception.Response.StatusCode -eq 401) {
-        $headers = $_.Exception.Response.Headers
-        $Realm = $headers['X-NDM-Realm']
-        $Challenge = $headers['X-NDM-Challenge']
-        Log "Got challenge"
-    } else {
-        Log "Auth error: $_"
+    try {
+        New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+        Log "Created backup directory: $BackupDir"
+    } catch {
+        Log "ERROR: Failed to create backup directory: $_"
         exit 1
     }
 }
 
-$md5Input = "$Login`:$Realm`:$RealPassword"
-$md5Bytes = [System.Text.Encoding]::UTF8.GetBytes($md5Input)
-$md5Hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash($md5Bytes)).Replace("-", "").ToLower()
-$shaInput = "$Challenge$md5Hash"
-$shaBytes = [System.Text.Encoding]::UTF8.GetBytes($shaInput)
-$shaHash = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($shaBytes)).Replace("-", "").ToLower()
+# Build API URL
+$ConfigUrl = "https://$RouterDomain/rci/show/running-config"
+Log "API URL: $ConfigUrl"
 
-$body = ([PSCustomObject]@{login = $Login; password = $shaHash} | ConvertTo-Json)
+# Prepare Basic Auth header
+$authString = "$Login`:$RealPassword"
+$authBytes = [System.Text.Encoding]::UTF8.GetBytes($authString)
+$authBase64 = [Convert]::ToBase64String($authBytes)
+$headers = @{
+    "Authorization" = "Basic $authBase64"
+}
+
+# Function to download config with retry
+function Get-KeeneticConfig {
+    param([int]$MaxRetries = 3)
+    
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        Log "=== ATTEMPT $attempt/$MaxRetries ==="
+        
+        try {
+            # Stage 1: API Request
+            Log "[STAGE 1] Sending request to API..."
+            $response = Invoke-WebRequest -Uri $ConfigUrl -Headers $headers -Method GET -TimeoutSec 30 -UseBasicParsing
+            
+            Log "[STAGE 1] Response received: HTTP $($response.StatusCode), Length: $($response.RawContentLength) bytes"
+            
+            # Stage 2: Parse JSON
+            Log "[STAGE 2] Parsing JSON response..."
+            $json = $response.Content | ConvertFrom-Json
+            
+            if (-not $json.message) {
+                throw "Invalid JSON format: 'message' field not found"
+            }
+            
+            Log "[STAGE 2] JSON parsed successfully, message array count: $($json.message.Count)"
+            
+            # Stage 3: Convert to text
+            Log "[STAGE 3] Converting JSON to text format..."
+            $textContent = $json.message -join "`r`n"
+            
+            Log "[STAGE 3] Conversion complete, text length: $($textContent.Length) characters"
+            
+            return $textContent
+            
+        } catch {
+            Log "[ERROR] Attempt $attempt failed: $_"
+            
+            if ($attempt -lt $MaxRetries) {
+                Log "[RETRY] Waiting 2 seconds before next attempt..."
+                Start-Sleep -Seconds 2
+            } else {
+                Log "[ERROR] All $MaxRetries attempts exhausted"
+                throw "Failed to download config after $MaxRetries attempts: $_"
+            }
+        }
+    }
+}
+
+# Main execution
 try {
-    $auth = Invoke-WebRequest -Uri $AuthUrl -Method POST -Body $body -ContentType "application/json" -WebSession $Session -TimeoutSec 10
-    Log "Auth OK: $($auth.StatusCode)"
+    Log "=== STARTING BACKUP ==="
+    
+    # Get config content
+    $configContent = Get-KeeneticConfig -MaxRetries 3
+    
+    # Generate filename with timestamp
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $year = Get-Date -Format "yyyy"
+    $month = Get-Date -Format "MM"
+    $week = (Get-Date -UFormat %V)
+    
+    # Determine what backups to create
+    $toCreate = @()
+    
+    # Daily backup always
+    $toCreate += @{Type = "daily"; Name = "daily-$timestamp"}
+    
+    # Yearly check
+    $yearlyName = "yearly-$year"
+    if (!(Test-Path (Join-Path $BackupDir "$yearlyName.zip"))) {
+        $toCreate += @{Type = "yearly"; Name = $yearlyName}
+    }
+    
+    # Monthly check
+    $monthlyName = "monthly-$year$month"
+    if (!(Test-Path (Join-Path $BackupDir "$monthlyName.zip"))) {
+        $toCreate += @{Type = "monthly"; Name = $monthlyName}
+    }
+    
+    # Weekly check
+    $weeklyName = "weekly-$year$week"
+    if (!(Test-Path (Join-Path $BackupDir "$weeklyName.zip"))) {
+        $toCreate += @{Type = "weekly"; Name = $weeklyName}
+    }
+    
+    Log "=== CREATING $($toCreate.Count) BACKUP(S) ==="
+    
+    foreach ($item in $toCreate) {
+        $tempFile = Join-Path $BackupDir "temp-$([Guid]::NewGuid().ToString().Substring(0,8)).txt"
+        $zipFile = Join-Path $BackupDir "$($item.Name).zip"
+        
+        try {
+            Log "Creating $($item.Name)..."
+            
+            # Save text content to temp file
+            $configContent | Out-File -FilePath $tempFile -Encoding UTF8 -Force
+            
+            # Create ZIP
+            Compress-Archive -Path $tempFile -DestinationPath $zipFile -Force
+            
+            # Cleanup temp file
+            Remove-Item $tempFile -Force
+            
+            $size = (Get-Item $zipFile).Length
+            Log "Created $($item.Name).zip ($size bytes)"
+            
+        } catch {
+            Log "ERROR creating $($item.Name): $_"
+            if (Test-Path $tempFile) { Remove-Item $tempFile -Force }
+        }
+    }
+    
+    # Rotation
+    Log "=== ROTATION ==="
+    
+    # Daily: keep 7
+    $dailies = Get-ChildItem $BackupDir -Filter "daily-*.zip" | Sort-Object Name -Descending
+    if ($dailies.Count -gt 7) {
+        $dailies | Select-Object -Skip 7 | ForEach-Object {
+            Remove-Item $_.FullName -Force
+            Log "Deleted old daily: $($_.Name)"
+        }
+    }
+    
+    # Weekly: keep 4
+    $weeklies = Get-ChildItem $BackupDir -Filter "weekly-*.zip" | Sort-Object Name -Descending
+    if ($weeklies.Count -gt 4) {
+        $weeklies | Select-Object -Skip 4 | ForEach-Object {
+            Remove-Item $_.FullName -Force
+            Log "Deleted old weekly: $($_.Name)"
+        }
+    }
+    
+    # Monthly: keep 12
+    $monthlies = Get-ChildItem $BackupDir -Filter "monthly-*.zip" | Sort-Object Name -Descending
+    if ($monthlies.Count -gt 12) {
+        $monthlies | Select-Object -Skip 12 | ForEach-Object {
+            Remove-Item $_.FullName -Force
+            Log "Deleted old monthly: $($_.Name)"
+        }
+    }
+    
+    # Yearly: keep 20
+    $yearlies = Get-ChildItem $BackupDir -Filter "yearly-*.zip" | Sort-Object Name -Descending
+    if ($yearlies.Count -gt 20) {
+        $yearlies | Select-Object -Skip 20 | ForEach-Object {
+            Remove-Item $_.FullName -Force
+            Log "Deleted old yearly: $($_.Name)"
+        }
+    }
+    
+    Log "=== BACKUP COMPLETED SUCCESSFULLY ==="
+    
 } catch {
-    Log "Auth failed: $_"
+    Log "CRITICAL ERROR: $_"
+    Log "Backup failed"
     exit 1
 }
-
-# Download
-$now = Get-Date
-$timestamp = $now.ToString("yyyyMMdd-HHmmss")
-$ConfigUrl = "http://$RouterIp/ci/startup-config.txt"
-$tempFile = Join-Path $BackupDir "temp-$timestamp.txt"
-
-Log "Downloading..."
-try {
-    Invoke-WebRequest -Uri $ConfigUrl -WebSession $Session -OutFile $tempFile -TimeoutSec 30
-    $size = (Get-Item $tempFile).Length
-    Log "Downloaded: $size bytes"
-} catch {
-    Log "ERROR download: $_"
-    exit 1
-}
-
-# Determine archive type
-$day = $now.Day
-$month = $now.Month
-$year = $now.Year
-$dayOfWeek = $now.DayOfWeek
-
-# Daily (every day)
-$archiveName = "daily-$timestamp.zip"
-
-# Weekly (every Sunday, keep 4)
-if ($dayOfWeek -eq "Sunday") {
-    $archiveName = "weekly-$timestamp.zip"
-}
-
-# Monthly (1st day of month, keep 12)
-if ($day -eq 1) {
-    $archiveName = "monthly-$timestamp.zip"
-}
-
-# Yearly (Jan 1, keep 20)
-if ($month -eq 1 -and $day -eq 1) {
-    $archiveName = "yearly-$timestamp.zip"
-}
-
-$archivePath = Join-Path $BackupDir $archiveName
-
-# Create ZIP
-try {
-    Compress-Archive -Path $tempFile -DestinationPath $archivePath -Force
-    Remove-Item $tempFile -Force
-    $zipSize = (Get-Item $archivePath).Length
-    Log "ZIP created: $archiveName ($zipSize bytes)"
-} catch {
-    Log "ERROR creating ZIP: $_"
-    Remove-Item $tempFile -Force
-    exit 1
-}
-
-# Rotation
-Log "=== ROTATION ==="
-
-# Daily: keep 7
-$dailies = Get-ChildItem $BackupDir -Filter "daily-*.zip" | Sort-Object Name -Descending
-if ($dailies.Count -gt 7) {
-    $toDelete = $dailies | Select-Object -Skip 7
-    foreach ($file in $toDelete) {
-        Remove-Item $file.FullName -Force
-        Log "Deleted old daily: $($file.Name)"
-    }
-}
-
-# Weekly: keep 4
-$weeklies = Get-ChildItem $BackupDir -Filter "weekly-*.zip" | Sort-Object Name -Descending
-if ($weeklies.Count -gt 4) {
-    $toDelete = $weeklies | Select-Object -Skip 4
-    foreach ($file in $toDelete) {
-        Remove-Item $file.FullName -Force
-        Log "Deleted old weekly: $($file.Name)"
-    }
-}
-
-# Monthly: keep 12
-$monthlies = Get-ChildItem $BackupDir -Filter "monthly-*.zip" | Sort-Object Name -Descending
-if ($monthlies.Count -gt 12) {
-    $toDelete = $monthlies | Select-Object -Skip 12
-    foreach ($file in $toDelete) {
-        Remove-Item $file.FullName -Force
-        Log "Deleted old monthly: $($file.Name)"
-    }
-}
-
-# Yearly: keep 20
-$yearlies = Get-ChildItem $BackupDir -Filter "yearly-*.zip" | Sort-Object Name -Descending
-if ($yearlies.Count -gt 20) {
-    $toDelete = $yearlies | Select-Object -Skip 20
-    foreach ($file in $toDelete) {
-        Remove-Item $file.FullName -Force
-        Log "Deleted old yearly: $($file.Name)"
-    }
-}
-
-Log "Done"
